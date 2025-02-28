@@ -3,8 +3,6 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
-const { HttpsProxyAgent } = require('https-proxy-agent');
-const { SocksProxyAgent } = require('socks-proxy-agent');
 
 global.navigator = { userAgent: 'node' };
 
@@ -56,8 +54,7 @@ function loadConfig() {
                     intervalSeconds: 10
                 },
                 threads: {
-                    maxWorkers: 10,
-                    proxyFile: 'proxies.txt'
+                    maxWorkers: 10
                 }
             };
             fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf8');
@@ -118,27 +115,6 @@ function coloredLog(message, type = 'INFO', color = 'white') {
             colorCode = colors.FG_WHITE;
     }
     console.log(`${colors.BRIGHT}[${getFormattedDate()}] ${colorCode}[${type}] ${message}${colors.RESET}`);
-}
-
-function loadProxies(config) {
-    try {
-        const proxyFile = path.join(__dirname, config.threads.proxyFile);
-        if (!fs.existsSync(proxyFile)) {
-            coloredLog(`Proxy file not found at ${proxyFile}, creating empty file`, 'WARN');
-            fs.writeFileSync(proxyFile, '', 'utf8');
-            return [];
-        }
-        const proxyData = fs.readFileSync(proxyFile, 'utf8');
-        const proxies = proxyData
-            .split('\n')
-            .map(line => line.trim())
-            .filter(line => line && !line.startsWith('#'));
-        coloredLog(`Loaded ${proxies.length} proxies from ${proxyFile}`, 'INFO', 'cyan');
-        return proxies;
-    } catch (error) {
-        coloredLog(`Error loading proxies: ${error.message}`, 'ERROR');
-        return [];
-    }
 }
 
 class CognitoAuth {
@@ -275,13 +251,6 @@ class TokenManager {
     }
 }
 
-function getProxyAgent(proxy) {
-    if (!proxy) return null;
-    if (proxy.startsWith('http')) return new HttpsProxyAgent(proxy);
-    if (proxy.startsWith('socks4') || proxy.startsWith('socks5')) return new SocksProxyAgent(proxy);
-    throw new Error(`Unsupported proxy protocol: ${proxy}`);
-}
-
 async function refreshTokens(refreshToken, config) {
     try {
         coloredLog('Refreshing access token via Stork API...', 'INFO', 'cyan');
@@ -341,9 +310,8 @@ async function getSignedPrices(tokens, config) {
     }
 }
 
-async function sendValidation(tokens, msgHash, isValid, proxy) {
+async function sendValidation(tokens, msgHash, isValid) {
     try {
-        const agent = getProxyAgent(proxy);
         const response = await axios({
             method: 'POST',
             url: 'https://app-api.jp.stork-oracle.network/v1/stork_signed_prices/validations',
@@ -353,13 +321,12 @@ async function sendValidation(tokens, msgHash, isValid, proxy) {
                 'Origin': 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
             },
-            httpsAgent: agent,
             data: { msg_hash: msgHash, valid: isValid }
         });
-        coloredLog(`✓ Validation successful for ${msgHash.substring(0, 10)}... via ${proxy || 'direct'}`, 'INFO', 'green');
+        coloredLog(`? Validation successful for ${msgHash.substring(0, 10)}...`, 'INFO', 'green');
         return response.data;
     } catch (error) {
-        coloredLog(`✗ Validation failed for ${msgHash.substring(0, 10)}...: ${error.message}`, 'ERROR');
+        coloredLog(`? Validation failed for ${msgHash.substring(0, 10)}...: ${error.message}`, 'ERROR');
         throw error;
     }
 }
@@ -406,12 +373,12 @@ function validatePrice(priceData) {
 }
 
 if (!isMainThread) {
-    const { priceData, tokens, proxy } = workerData;
+    const { priceData, tokens } = workerData;
 
     async function validateAndSend() {
         try {
             const isValid = validatePrice(priceData);
-            await sendValidation(tokens, priceData.msg_hash, isValid, proxy);
+            await sendValidation(tokens, priceData.msg_hash, isValid);
             parentPort.postMessage({ success: true, msgHash: priceData.msg_hash, isValid });
         } catch (error) {
             parentPort.postMessage({ success: false, error: error.message, msgHash: priceData.msg_hash });
@@ -441,7 +408,6 @@ if (!isMainThread) {
             }
 
             const signedPrices = await getSignedPrices(tokens, config);
-            const proxies = loadProxies(config);
 
             if (!signedPrices || signedPrices.length === 0) {
                 coloredLog('No data to validate', 'WARN');
@@ -461,12 +427,11 @@ if (!isMainThread) {
 
             for (let i = 0; i < Math.min(batches.length, config.threads.maxWorkers); i++) {
                 const batch = batches[i];
-                const proxy = proxies.length > 0 ? proxies[i % proxies.length] : null;
 
                 batch.forEach(priceData => {
                     workers.push(new Promise((resolve) => {
                         const worker = new Worker(__filename, {
-                            workerData: { priceData, tokens, proxy }
+                            workerData: { priceData, tokens }
                         });
                         worker.on('message', resolve);
                         worker.on('error', (error) => resolve({ success: false, error: error.message }));
@@ -497,6 +462,9 @@ if (!isMainThread) {
             coloredLog('--------- COMPLETE ---------', 'INFO', 'blue');
         } catch (error) {
             coloredLog(`Validation process stopped: ${error.message}`, 'ERROR');
+        } finally {
+            // Immediately reschedule the next run
+            setTimeout(() => runValidationProcess(tokenManager, config), 0);  // Run immediately
         }
     }
 
@@ -532,12 +500,12 @@ if (!isMainThread) {
         console.log(colors.FG_WHITE + `Referral Code: ${userData.referral_code || 'N/A'}` + colors.RESET);
         console.log(colors.FG_CYAN + '---------------------------------------------' + colors.RESET);
         console.log(colors.BRIGHT + colors.FG_GREEN + 'VALIDATION STATISTICS:' + colors.RESET);
-        console.log(colors.FG_GREEN + `✓ Valid Validations: ${userData.stats.stork_signed_prices_valid_count || 0}` + colors.RESET);
-        console.log(colors.FG_RED + `✗ Invalid Validations: ${userData.stats.stork_signed_prices_invalid_count || 0}` + colors.RESET);
-        console.log(colors.FG_WHITE + `↻ Last Validated At: ${userData.stats.stork_signed_prices_last_verified_at || 'Never'}` + colors.RESET);
-        console.log(colors.FG_WHITE + `👥 Referral Usage Count: ${userData.stats.referral_usage_count || 0}` + colors.RESET);
+        console.log(colors.FG_GREEN + `? Valid Validations: ${userData.stats.stork_signed_prices_valid_count || 0}` + colors.RESET);
+        console.log(colors.FG_RED + `? Invalid Validations: ${userData.stats.stork_signed_prices_invalid_count || 0}` + colors.RESET);
+        console.log(colors.FG_WHITE + `? Last Validated At: ${userData.stats.stork_signed_prices_last_verified_at || 'Never'}` + colors.RESET);
+        console.log(colors.FG_WHITE + `?? Referral Usage Count: ${userData.stats.referral_usage_count || 0}` + colors.RESET);
         console.log(colors.FG_CYAN + '---------------------------------------------' + colors.RESET);
-        console.log(colors.FG_YELLOW + `Next validation in ${config.stork.intervalSeconds} seconds...` + colors.RESET);
+        //Removed: console.log(colors.FG_YELLOW + `Next validation in ${config.stork.intervalSeconds} seconds...` + colors.RESET);
         console.log(colors.BRIGHT + colors.FG_CYAN + '=============================================' + colors.RESET);
     }
 
@@ -573,6 +541,7 @@ if (!isMainThread) {
                 await tokenManager.getValidToken();
                 coloredLog(`Authentication successful for ${account.username}`, 'INFO', 'green');
 
+                // Remove initial delay
                 runValidationProcess(tokenManager, config);
             } catch (error) {
                 coloredLog(`Error with account ${account.username}: ${error.message}`, 'ERROR');
