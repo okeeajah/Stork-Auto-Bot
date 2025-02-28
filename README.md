@@ -22,7 +22,7 @@ Automated validation bot for the Stork Oracle network. This bot helps you automa
 
 1. Clone the repository:
 ```
-git clone https://github.com/airdropinsiders/Stork-Auto-Bot.git
+git clone https://github.com/okeeajah/Stork-Auto-Bot.git
 ```
 
 2. Navigate to the project directory:
@@ -82,7 +82,7 @@ To use proxy servers for distribution of requests:
 
 Start the bot with:
 ```
-node stork-bot.js
+node bot.js
 ```
 
 The bot will:
