@@ -10,12 +10,13 @@ Automated validation bot for the Stork Oracle network. This bot helps you automa
 - Handles token refresh for continuous operation
 - Displays validation statistics and user information
 - Configurable validation interval
+- Support for proxy servers to distribute requests
+- Multi-threaded processing for improved performance
 
 ## Requirements
 
 - Node.js 14.0.0 or higher
 - Valid Stork Oracle account
-- Authentication tokens from your Stork Oracle account
 
 ## Installation
 
@@ -34,55 +35,77 @@ cd Stork-Auto-Bot
 npm install
 ```
 
-4. Configure your tokens (see Configuration section below)
+4. Configure your credentials (see Configuration section below)
 
 ## Configuration
 
-You need to provide your Stork Oracle authentication tokens for the bot to work. These can be extracted from your Stork Oracle web app's localStorage.
+### Easy Setup with config.json
 
-1. Create a `tokens.json` file in the project root with the following format:
+The bot now uses a config.json file for configuration. When you run the bot for the first time, it will create a default config.json file that you can edit.
+
+1. Run the bot once to generate the default config file:
+```
+node index.js
+```
+
+2. Edit the generated `config.json` file with your credentials:
 ```json
 {
-  "accessToken": "your-access-token-here",
-  "idToken": "your-id-token-here",
-  "refreshToken": "your-refresh-token-here",
-  "isAuthenticated": true,
-  "isVerifying": true
+  "cognito": {
+    "region": "ap-northeast-1",
+    "clientId": "5msns4n49hmg3dftp2tp1t2iuh",
+    "userPoolId": "ap-northeast-1_M22I44OpC",
+    "username": "your-email@example.com",
+    "password": "your-password"
+  },
+  "stork": {
+    "intervalSeconds": 5
+  },
+  "threads": {
+    "maxWorkers": 1
+  }
 }
 ```
 
-2. Optional: Adjust the configuration in `index.js` to modify:
-   - Polling interval (default: 10 seconds)
-   - API endpoints
-   - Validation rules
+3. Replace `username` and `password` with your Stork Oracle account credentials
 
-### How to Get Your Tokens
+### Optional: Proxy Configuration
 
-1. Log in to the Stork Oracle web app
-2. Open browser developer tools (F12 or right-click > Inspect)
-3. Go to the Application tab
-4. Navigate to localStorage under Storage
-5. Look for authentication tokens and copy them to your tokens.json file
+To use proxy servers for distribution of requests:
+
+1. Create a `proxies.txt` file in the project root
+2. Add one proxy per line in any of these formats:
+   - HTTP proxies: `http://user:pass@host:port`
+   - SOCKS proxies: `socks5://user:pass@host:port`
 
 ## Usage
 
 Start the bot with:
 ```
-npm start
+node stork-bot.js
 ```
 
 The bot will:
-1. Authenticate using your tokens
+1. Authenticate using your credentials from config.json
 2. Fetch signed price data at regular intervals
 3. Validate each data point
 4. Submit validation results to Stork Oracle
 5. Display your current statistics
 
+## Advanced Configuration Options
+
+In your `config.json` file, you can adjust:
+
+- `stork.intervalSeconds`: How often the validation process runs in seconds (default: 5)
+- `threads.maxWorkers`: Number of concurrent validation workers (default: 1)
+
 ## Troubleshooting
 
-- If you see token-related errors, check that your tokens are valid and properly formatted in tokens.json
-- If the bot stops refreshing tokens, your refresh token may have expired - update tokens.json with fresh tokens
+- If you see authentication errors, check that your username and password in config.json are correct
+- If the bot fails to start, ensure your config.json file is properly formatted JSON
+- If you see token-related errors after successful authentication, the tokens.json file may be corrupted - delete it and let the bot regenerate it
 - For connection issues, check your internet connection and verify the Stork Oracle API is accessible
+- If using proxies, check that your proxies.txt is properly formatted and proxies are operational
 
 ## Disclaimer
 
