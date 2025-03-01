@@ -51,20 +51,30 @@ node index.js
 2. Edit the generated `config.json` file with your credentials:
 ```json
 {
-  "cognito": {
-    "region": "ap-northeast-1",
-    "clientId": "5msns4n49hmg3dftp2tp1t2iuh",
-    "userPoolId": "ap-northeast-1_M22I44OpC",
-    "username": "your-email@example.com",
-    "password": "your-password"
-  },
+  "accounts": [
+    {
+      "region": "ap-northeast-1",
+      "clientId": "5msns4n49hmg3dftp2tp1t2iuh",
+      "userPoolId": "ap-northeast-1_M22I44OpC",
+      "username": "your-email@example.com",
+      "password": "your-password"
+    },
+    {
+      "region": "ap-northeast-1",
+      "clientId": "CLIENT_ID_2",
+      "userPoolId": "USER_POOL_ID_2",
+      "username": "USERNAME_2",
+      "password": "PASSWORD_2"
+    }
+  ],
   "stork": {
     "intervalSeconds": 5
   },
   "threads": {
-    "maxWorkers": 1
+    "maxWorkers": 4
   }
 }
+
 ```
 
 3. Replace `username` and `password` with your Stork Oracle account credentials
