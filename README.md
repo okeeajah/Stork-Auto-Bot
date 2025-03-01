@@ -71,7 +71,7 @@ node index.js
     "intervalSeconds": 5
   },
   "threads": {
-    "maxWorkers": 4
+    "maxWorkers": 1
   }
 }
 
