@@ -29,7 +29,7 @@ const colors = {
     BG_BLACK: "\x1b[40m",
     BG_RED: "\x1b[41m",
     BG_GREEN: "\x1b[42m",
-    BG_YELLOW: "\x1b[43m",
+    FG_YELLOW: "\x1b[33m",
     BG_BLUE: "\x1b[44m",
     BG_MAGENTA: "\x1b[45m",
     BG_CYAN: "\x1b[46m",
@@ -76,7 +76,7 @@ function loadConfig() {
 function validateAccountConfig(cognitoConfig) {
     if (!cognitoConfig.username || !cognitoConfig.password) {
         coloredLog('ERROR: Username dan password harus diatur di config.json', 'ERROR');
-        console.log('\nPlease update your config.json file with your credentials:');
+        console.log('\nHarap perbarui file config.json Anda dengan kredensial Anda:');
         console.log(JSON.stringify({
             accounts: [{
                 username: "YOUR_EMAIL",
@@ -165,11 +165,16 @@ class CognitoAuth {
         const refreshTokenObj = new AmazonCognitoIdentity.CognitoRefreshToken({ RefreshToken: refreshToken });
         return new Promise((resolve, reject) => {
             cognitoUser.refreshSession(refreshTokenObj, (err, result) => {
-                if (err) reject(err);
-                else resolve({
+                if (err) {
+                    console.error("Failed to refresh session:", err);
+                    reject(err);
+                    return;
+                }
+
+                resolve({
                     accessToken: result.getAccessToken().getJwtToken(),
                     idToken: result.getIdToken().getJwtToken(),
-                    refreshToken: refreshToken,
+                    refreshToken: refreshToken, // Use the same refresh token
                     expiresIn: result.getAccessToken().getExpiration() * 1000 - Date.now()
                 });
             });
@@ -189,7 +194,14 @@ class TokenManager {
     }
 
     async getValidToken() {
-        if (!this.accessToken || this.isTokenExpired()) await this.refreshOrAuthenticate();
+        if (!this.accessToken || this.isTokenExpired()) {
+            try {
+                await this.refreshOrAuthenticate();
+            } catch (error) {
+                coloredLog(`Failed to refresh/authenticate token: ${error.message}`, 'ERROR');
+                throw error;
+            }
+        }
         return this.accessToken;
     }
 
@@ -205,9 +217,9 @@ class TokenManager {
             if (tokens && tokens.refreshToken) {
                 try {
                     result = await this.auth.refreshSession(tokens.refreshToken);
-                    coloredLog(`Token refreshed successfully for ${this.config.username}`, 'INFO', 'green');
+                    coloredLog(`Token berhasil disegarkan untuk ${this.config.username}`, 'INFO', 'green');
                 } catch (refreshError) {
-                    coloredLog(`Token refresh failed for ${this.config.username}: ${refreshError.message}, attempting authentication`, 'WARN');
+                    coloredLog(`Penyegaran token gagal untuk ${this.config.username}: ${refreshError.message}, mencoba autentikasi`, 'WARN');
                     result = await this.auth.authenticate(this.config.username, this.config.password);
                 }
             } else {
@@ -216,7 +228,7 @@ class TokenManager {
 
             await this.updateTokens(result);
         } catch (error) {
-            coloredLog(`Token refresh/auth error for ${this.config.username}: ${error.message}`, 'ERROR');
+            coloredLog(`Error penyegaran/autentikasi token untuk ${this.config.username}: ${error.message}`, 'ERROR');
             throw error;
         }
     }
@@ -228,7 +240,7 @@ class TokenManager {
         this.expiresAt = Date.now() + result.expiresIn;
         const tokens = { accessToken: this.accessToken, idToken: this.idToken, refreshToken: this.refreshToken, isAuthenticated: true, isVerifying: false };
         await this.saveTokens(tokens);
-        coloredLog(`Tokens updated and saved to ${this.tokenPath} for ${this.config.username}`, 'INFO', 'green');
+        coloredLog(`Token diperbarui dan disimpan ke ${this.tokenPath} untuk ${this.config.username}`, 'INFO', 'green');
     }
 
     async loadTokens() {
@@ -238,10 +250,10 @@ class TokenManager {
             }
             const tokensData = await fs.promises.readFile(this.tokenPath, 'utf8');
             const tokens = JSON.parse(tokensData);
-            coloredLog(`Successfully read tokens from ${this.tokenPath} for ${this.config.username}`, 'INFO', 'green');
+            coloredLog(`Berhasil membaca token dari ${this.tokenPath} untuk ${this.config.username}`, 'INFO', 'green');
             return tokens;
         } catch (error) {
-            coloredLog(`Error reading tokens from ${this.tokenPath} for ${this.config.username}: ${error.message}`, 'ERROR');
+            coloredLog(`Error membaca token dari ${this.tokenPath} untuk ${this.config.username}: ${error.message}`, 'ERROR');
             return null;
         }
     }
@@ -249,28 +261,29 @@ class TokenManager {
     async saveTokens(tokens) {
         try {
             await fs.promises.writeFile(this.tokenPath, JSON.stringify(tokens, null, 2), 'utf8');
-            coloredLog(`Tokens saved successfully to ${this.tokenPath} for ${this.config.username}`, 'INFO', 'green');
+            coloredLog(`Token berhasil disimpan ke ${this.tokenPath} untuk ${this.config.username}`, 'INFO', 'green');
             return true;
         } catch (error) {
-            coloredLog(`Error saving tokens to ${this.tokenPath} for ${this.config.username}: ${error.message}`, 'ERROR');
+            coloredLog(`Error menyimpan token ke ${this.tokenPath} untuk ${this.config.username}: ${error.message}`, 'ERROR');
             return false;
         }
     }
 }
 
-async function refreshTokens(refreshToken, config) {
+async function refreshTokensStork(refreshToken, config) {
     try {
-        coloredLog('Refreshing access token via Stork API...', 'INFO', 'cyan');
-        const response = await axios({
+        coloredLog('Menyegarkan access token via Stork API...', 'INFO', 'cyan');
+        const axiosConfig = {
             method: 'POST',
             url: `https://api.jp.stork-oracle.network/auth/refresh`,
             headers: {
                 'Content-Type': 'application/json',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
                 'Origin': 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl'
-            },
-            data: { refresh_token: refreshToken }
-        });
+            }
+        };
+
+        const response = await axios(axiosConfig, { data: { refresh_token: refreshToken } });
         const tokens = {
             accessToken: response.data.access_token,
             idToken: response.data.id_token || '',
@@ -280,15 +293,15 @@ async function refreshTokens(refreshToken, config) {
         };
         return tokens;
     } catch (error) {
-        coloredLog(`Token refresh failed: ${error.message}`, 'ERROR');
+        coloredLog(`Token refresh gagal: ${error.message}`, 'ERROR');
         throw error;
     }
 }
 
 async function getSignedPrices(tokens, config) {
     try {
-        coloredLog('Fetching signed prices data...', 'INFO', 'cyan');
-        const response = await axios({
+        coloredLog('Mengambil data harga yang ditandatangani...', 'INFO', 'cyan');
+        const axiosConfig = {
             method: 'GET',
             url: 'https://app-api.jp.stork-oracle.network/v1/stork_signed_prices',
             headers: {
@@ -297,7 +310,8 @@ async function getSignedPrices(tokens, config) {
                 'Origin': 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
             }
-        });
+        };
+        const response = await axios(axiosConfig);
         const dataObj = response.data.data;
         const result = Object.keys(dataObj).map(assetKey => {
             const assetData = dataObj[assetKey];
@@ -309,17 +323,19 @@ async function getSignedPrices(tokens, config) {
                 ...assetData
             };
         });
-        coloredLog(`Successfully retrieved ${result.length} signed prices`, 'INFO', 'green');
+        coloredLog(`Berhasil mengambil ${result.length} harga yang ditandatangani`, 'INFO', 'green');
         return result;
     } catch (error) {
-        coloredLog(`Error getting signed prices: ${error.message}`, 'ERROR');
+        coloredLog(`Error mendapatkan harga yang ditandatangani: ${error.message}`, 'ERROR');
         throw error;
     }
 }
 
 async function sendValidation(tokens, msgHash, isValid) {
     try {
-        const response = await axios({
+        await randomDelay(1000, 3000); // Delay sebelum permintaan
+
+        const axiosConfig = {
             method: 'POST',
             url: 'https://app-api.jp.stork-oracle.network/v1/stork_signed_prices/validations',
             headers: {
@@ -329,19 +345,20 @@ async function sendValidation(tokens, msgHash, isValid) {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
             },
             data: { msg_hash: msgHash, valid: isValid }
-        });
-        coloredLog(`? Validation successful for ${msgHash.substring(0, 10)}...`, 'INFO', 'green');
+        };
+        const response = await axios(axiosConfig);
+        coloredLog(`? Validasi berhasil untuk ${msgHash.substring(0, 10)}...`, 'INFO', 'green');
         return response.data;
     } catch (error) {
-        coloredLog(`? Validation failed for ${msgHash.substring(0, 10)}...: ${error.message}`, 'ERROR');
+        coloredLog(`? Validasi gagal untuk ${msgHash.substring(0, 10)}...: ${error.message}`, 'ERROR');
         throw error;
     }
 }
 
 async function getUserStats(tokens) {
     try {
-        coloredLog('Fetching user stats...', 'INFO', 'cyan');
-        const response = await axios({
+        coloredLog('Mengambil statistik pengguna...', 'INFO', 'cyan');
+        const axiosConfig = {
             method: 'GET',
             url: 'https://app-api.jp.stork-oracle.network/v1/me',
             headers: {
@@ -350,31 +367,33 @@ async function getUserStats(tokens) {
                 'Origin': 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
             }
-        });
+        };
+
+        const response = await axios(axiosConfig);
         return response.data.data;
     } catch (error) {
-        coloredLog(`Error getting user stats: ${error.message}`, 'ERROR');
+        coloredLog(`Error mendapatkan statistik pengguna: ${error.message}`, 'ERROR');
         throw error;
     }
 }
 
 function validatePrice(priceData) {
     try {
-        coloredLog(`Validating data for ${priceData.asset || 'unknown asset'}`, 'INFO', 'cyan');
+        coloredLog(`Memvalidasi data untuk ${priceData.asset || 'aset tidak dikenal'}`, 'INFO', 'cyan');
         if (!priceData.msg_hash || !priceData.price || !priceData.timestamp) {
-            coloredLog('Incomplete data, considered invalid', 'WARN');
+            coloredLog('Data tidak lengkap, dianggap tidak valid', 'WARN');
             return false;
         }
         const currentTime = Date.now();
         const dataTime = new Date(priceData.timestamp).getTime();
         const timeDiffMinutes = (currentTime - dataTime) / (1000 * 60);
         if (timeDiffMinutes > 60) {
-            coloredLog(`Data too old (${Math.round(timeDiffMinutes)} minutes ago)`, 'WARN');
+            coloredLog(`Data terlalu lama (${Math.round(timeDiffMinutes)} menit yang lalu)`, 'WARN');
             return false;
         }
         return true;
     } catch (error) {
-        coloredLog(`Validation error: ${error.message}`, 'ERROR');
+        coloredLog(`Validasi error: ${error.message}`, 'ERROR');
         return false;
     }
 }
@@ -403,7 +422,7 @@ if (!isMainThread) {
             const initialUserData = await getUserStats(tokens);
 
             if (!initialUserData || !initialUserData.stats) {
-                throw new Error('Could not fetch initial user stats');
+                throw new Error('Tidak dapat mengambil statistik pengguna awal');
             }
 
             const initialValidCount = initialUserData.stats.stork_signed_prices_valid_count || 0;
@@ -423,7 +442,7 @@ if (!isMainThread) {
                 return;
             }
 
-            coloredLog(`Processing ${signedPrices.length} data points with ${config.threads.maxWorkers} workers...`, 'INFO', 'cyan');
+            coloredLog(`Memproses ${signedPrices.length} titik data dengan ${config.threads.maxWorkers} pekerja...`, 'INFO', 'cyan');
             const workers = [];
 
             const chunkSize = Math.ceil(signedPrices.length / config.threads.maxWorkers);
@@ -509,8 +528,8 @@ if (!isMainThread) {
         console.log(colors.BRIGHT + colors.FG_GREEN + 'VALIDATION STATISTICS:' + colors.RESET);
         console.log(colors.FG_GREEN + `? Valid Validations: ${userData.stats.stork_signed_prices_valid_count || 0}` + colors.RESET);
         console.log(colors.FG_RED + `? Invalid Validations: ${userData.stats.stork_signed_prices_invalid_count || 0}` + colors.RESET);
-        console.log(colors.FG_WHITE + `? Last Validated At: ${userData.stats.stork_signed_prices_last_verified_at || 'Never'}` + colors.RESET);
-        console.log(colors.FG_WHITE + `?? Referral Usage Count: ${userData.stats.referral_usage_count || 0}` + colors.RESET);
+        console.log(colors.FG_WHITE + `? Terakhir Divalidasi Pada: ${userData.stats.stork_signed_prices_last_verified_at || 'Tidak Pernah'}` + colors.RESET);
+        console.log(colors.FG_WHITE + `?? Penggunaan Referral: ${userData.stats.referral_usage_count || 0}` + colors.RESET);
         console.log(colors.FG_CYAN + '---------------------------------------------' + colors.RESET);
         //Removed: console.log(colors.FG_YELLOW + `Next validation in ${config.stork.intervalSeconds} seconds...` + colors.RESET);
         console.log(colors.BRIGHT + colors.FG_CYAN + '=============================================' + colors.RESET);
@@ -520,7 +539,7 @@ if (!isMainThread) {
         const userConfig = loadConfig();
 
         if (!userConfig.accounts || userConfig.accounts.length === 0) {
-            coloredLog('No accounts configured in config.json', 'ERROR');
+            coloredLog('Tidak ada akun yang dikonfigurasi di config.json', 'ERROR');
             process.exit(1);
         }
 
