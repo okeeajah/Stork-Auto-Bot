@@ -1,5 +1,3 @@
-// Import Modul yang Diperlukan
-const AmazonCognitoIdentity = require('amazon-cognito-identity-js');
 const { CognitoIdentityProviderClient, InitiateAuthCommand } = require("@aws-sdk/client-cognito-identity-provider");
 const axios = require('axios');
 const fs = require('fs');
@@ -33,7 +31,7 @@ const colors = {
     BG_BLUE: "\x1b[44m",
     BG_MAGENTA: "\x1b[45m",
     BG_CYAN: "\x1b[46m",
-    BG_WHITE: "\x1b[47m"
+    BG_WHITE: "\x47m"
 };
 
 // Fungsi untuk Memuat Konfigurasi dari config.json
@@ -42,7 +40,6 @@ function loadConfig() {
         const configPath = path.join(__dirname, 'config.json');
         if (!fs.existsSync(configPath)) {
             coloredLog(`File konfigurasi tidak ditemukan di ${configPath}, menggunakan konfigurasi default`, 'WARN');
-            // Membuat file konfigurasi default jika tidak ada
             const defaultConfig = {
                 accounts: [
                     {
@@ -58,6 +55,10 @@ function loadConfig() {
                 },
                 threads: {
                     maxWorkers: 10
+                },
+                waf: {  // Konfigurasi WAF
+                    retryIntervalSeconds: 60, // Jeda sebelum mencoba lagi setelah diblokir
+                    maxRetries: 3              // Jumlah maksimum percobaan ulang
                 }
             };
             fs.writeFileSync(configPath, JSON.stringify(defaultConfig, null, 2), 'utf8');
@@ -124,61 +125,80 @@ function randomDelay(min, max) {
     return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
 }
 
+function getRandomUserAgent() {
+    const userAgents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:89.0) Gecko/20100101 Firefox/89.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Safari/537.36'
+    ];
+    return userAgents[Math.floor(Math.random() * userAgents.length)];
+}
+
 class CognitoAuth {
     constructor(config) {
         this.config = config;
-        this.userPool = new AmazonCognitoIdentity.CognitoUserPool({
-            UserPoolId: config.userPoolId,
-            ClientId: config.clientId
-        });
+        this.client = new CognitoIdentityProviderClient({ region: config.region });
     }
 
-    authenticate(username, password) {
-        const authenticationDetails = new AmazonCognitoIdentity.AuthenticationDetails({
-            Username: username,
-            Password: password
-        });
-        const cognitoUser = new AmazonCognitoIdentity.CognitoUser({
-            Username: username,
-            Pool: this.userPool
-        });
-
-        return new Promise((resolve, reject) => {
-            cognitoUser.authenticateUser(authenticationDetails, {
-                onSuccess: (result) => resolve({
-                    accessToken: result.getAccessToken().getJwtToken(),
-                    idToken: result.getIdToken().getJwtToken(),
-                    refreshToken: result.getRefreshToken().getToken(),
-                    expiresIn: result.getAccessToken().getExpiration() * 1000 - Date.now()
-                }),
-                onFailure: (err) => reject(err),
-                newPasswordRequired: () => reject(new Error('New password required'))
+    async authenticate(username, password, retryCount = 0) {
+        try {
+            const command = new InitiateAuthCommand({
+                AuthFlow: "USER_PASSWORD_AUTH",
+                ClientId: this.config.clientId,
+                AuthParameters: {
+                    USERNAME: username,
+                    PASSWORD: password,
+                },
             });
-        });
+
+            const response = await this.client.send(command);
+            return {
+                accessToken: response.AuthenticationResult?.AccessToken,
+                idToken: response.AuthenticationResult?.IdToken,
+                refreshToken: response.AuthenticationResult?.RefreshToken,
+                expiresIn: Date.now() + (response.AuthenticationResult?.ExpiresIn * 1000),
+            };
+        } catch (error) {
+            coloredLog(`Autentikasi gagal: ${error.message}`, 'ERROR');
+            if (error.message.includes('WAF') && retryCount < this.config.waf.maxRetries) {
+                const delay = this.config.waf.retryIntervalSeconds * 1000;
+                coloredLog(`WAF terdeteksi, mencoba lagi setelah ${this.config.waf.retryIntervalSeconds} detik (percobaan ${retryCount + 1})`, 'WARN');
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return this.authenticate(username, password, retryCount + 1); // Rekursi dengan retryCount bertambah
+            }
+            throw error;
+        }
     }
 
-    refreshSession(refreshToken) {
-        const cognitoUser = new AmazonCognitoIdentity.CognitoUser({
-            Username: this.config.username,
-            Pool: this.userPool
-        });
-        const refreshTokenObj = new AmazonCognitoIdentity.CognitoRefreshToken({ RefreshToken: refreshToken });
-        return new Promise((resolve, reject) => {
-            cognitoUser.refreshSession(refreshTokenObj, (err, result) => {
-                if (err) {
-                    console.error("Failed to refresh session:", err);
-                    reject(err);
-                    return;
-                }
-
-                resolve({
-                    accessToken: result.getAccessToken().getJwtToken(),
-                    idToken: result.getIdToken().getJwtToken(),
-                    refreshToken: refreshToken, // Use the same refresh token
-                    expiresIn: result.getAccessToken().getExpiration() * 1000 - Date.now()
-                });
+    async refreshSession(refreshToken, retryCount = 0) {
+        try {
+            const command = new InitiateAuthCommand({
+                AuthFlow: "REFRESH_TOKEN_AUTH",
+                ClientId: this.config.clientId,
+                AuthParameters: {
+                    REFRESH_TOKEN: refreshToken,
+                },
             });
-        });
+
+            const response = await this.client.send(command);
+            return {
+                accessToken: response.AuthenticationResult?.AccessToken,
+                idToken: response.AuthenticationResult?.IdToken,
+                expiresIn: Date.now() + (response.AuthenticationResult?.ExpiresIn * 1000),
+                refreshToken // Refresh token tetap sama
+            };
+        } catch (error) {
+            coloredLog(`Penyegaran token gagal: ${error.message}`, 'ERROR');
+            if (error.message.includes('WAF') && retryCount < this.config.waf.maxRetries) {
+                const delay = this.config.waf.retryIntervalSeconds * 1000;
+                coloredLog(`WAF terdeteksi, mencoba lagi setelah ${this.config.waf.retryIntervalSeconds} detik (percobaan ${retryCount + 1})`, 'WARN');
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return this.refreshSession(refreshToken, retryCount + 1); // Rekursi dengan retryCount bertambah
+            }
+            throw error;
+        }
     }
 }
 
@@ -198,7 +218,7 @@ class TokenManager {
             try {
                 await this.refreshOrAuthenticate();
             } catch (error) {
-                coloredLog(`Failed to refresh/authenticate token: ${error.message}`, 'ERROR');
+                coloredLog(`Failed to refresh/authenticate token for ${this.config.username}: ${error.message}`, 'ERROR');
                 throw error;
             }
         }
@@ -234,13 +254,21 @@ class TokenManager {
     }
 
     async updateTokens(result) {
-        this.accessToken = result.accessToken;
-        this.idToken = result.idToken;
-        this.refreshToken = result.refreshToken;
-        this.expiresAt = Date.now() + result.expiresIn;
-        const tokens = { accessToken: this.accessToken, idToken: this.idToken, refreshToken: this.refreshToken, isAuthenticated: true, isVerifying: false };
+        this.accessToken = result?.accessToken;
+        this.idToken = result?.idToken;
+        this.refreshToken = result?.refreshToken;
+        this.expiresAt = Date.now() + (result?.expiresIn || 0);
+
+        const tokens = {
+            accessToken: this.accessToken,
+            idToken: this.idToken,
+            refreshToken: this.refreshToken,
+            isAuthenticated: true,
+            isVerifying: false
+        };
+
         await this.saveTokens(tokens);
-        coloredLog(`Token diperbarui dan disimpan ke ${this.tokenPath} untuk ${this.config.username}`, 'INFO', 'green');
+        coloredLog(`Tokens updated and saved to ${this.tokenPath} for ${this.config.username}`, 'INFO', 'green');
     }
 
     async loadTokens() {
@@ -248,12 +276,17 @@ class TokenManager {
             if (!fs.existsSync(this.tokenPath)) {
                 return null;
             }
+
             const tokensData = await fs.promises.readFile(this.tokenPath, 'utf8');
             const tokens = JSON.parse(tokensData);
-            coloredLog(`Berhasil membaca token dari ${this.tokenPath} untuk ${this.config.username}`, 'INFO', 'green');
+
+            coloredLog(`Successfully read tokens from ${this.tokenPath} for ${this.config.username}`, 'INFO', 'green');
+
             return tokens;
+
         } catch (error) {
-            coloredLog(`Error membaca token dari ${this.tokenPath} untuk ${this.config.username}: ${error.message}`, 'ERROR');
+            coloredLog(`Error reading tokens from ${this.tokenPath} for ${this.config.username}: ${error.message}`, 'ERROR');
+
             return null;
         }
     }
@@ -261,77 +294,120 @@ class TokenManager {
     async saveTokens(tokens) {
         try {
             await fs.promises.writeFile(this.tokenPath, JSON.stringify(tokens, null, 2), 'utf8');
-            coloredLog(`Token berhasil disimpan ke ${this.tokenPath} untuk ${this.config.username}`, 'INFO', 'green');
+
+            coloredLog(`Tokens successfully saved to ${this.tokenPath} for ${this.config.username}`, 'INFO', 'green');
+
             return true;
+
         } catch (error) {
-            coloredLog(`Error menyimpan token ke ${this.tokenPath} untuk ${this.config.username}: ${error.message}`, 'ERROR');
+
+            coloredLog(`Error saving tokens to ${this.tokenPath} for ${this.config.username}: ${error.message}`, 'ERROR');
+
             return false;
+
         }
+
     }
 }
 
-async function refreshTokensStork(refreshToken, config) {
+async function refreshTokensStork(refreshToken, config, wafRetryCount = 0) {
     try {
         coloredLog('Menyegarkan access token via Stork API...', 'INFO', 'cyan');
+
         const axiosConfig = {
             method: 'POST',
             url: `https://api.jp.stork-oracle.network/auth/refresh`,
             headers: {
                 'Content-Type': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-                'Origin': 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl'
-            }
+                'User-Agent': getRandomUserAgent(), // User-Agent acak
+                Origin: 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl'
+            },
+            data: { refresh_token: refreshToken }
         };
 
-        const response = await axios(axiosConfig, { data: { refresh_token: refreshToken } });
+        const response = await axios(axiosConfig);
+
         const tokens = {
-            accessToken: response.data.access_token,
-            idToken: response.data.id_token || '',
-            refreshToken: response.data.refresh_token || refreshToken,
+            accessToken: response.data?.access_token,
+            idToken: response.data?.id_token || '',
+            refreshToken: response.data?.refresh_token || refreshToken,
             isAuthenticated: true,
             isVerifying: false
         };
+
         return tokens;
+
     } catch (error) {
-        coloredLog(`Token refresh gagal: ${error.message}`, 'ERROR');
+        coloredLog(`Gagal menyegarkan token :${error.message}`, 'ERROR');
+
+        if (error.message.includes('WAF') && wafRetryCount < config.waf.maxRetries) {
+            const delay = config.waf.retryIntervalSeconds * 1000;
+
+            coloredLog(`WAF terdeteksi , mencoba lagi setelah${config.waf.retryIntervalSeconds} detik(percobaan${wafRetryCount + 1})`, 'WARN');
+
+            await new Promise(resolve => setTimeout(resolve, delay));
+
+            return refreshTokensStork(refreshToken, config, wafRetryCount + 1); // Rekursi dengan wafRetryCount bertambah
+        }
+
         throw error;
+
     }
 }
 
-async function getSignedPrices(tokens, config) {
+async function getSignedPrices(tokens, config, wafRetryCount = 0) {
     try {
         coloredLog('Mengambil data harga yang ditandatangani...', 'INFO', 'cyan');
+
         const axiosConfig = {
             method: 'GET',
             url: 'https://app-api.jp.stork-oracle.network/v1/stork_signed_prices',
             headers: {
-                'Authorization': `Bearer ${tokens.accessToken}`,
+                Authorization: `Bearer ${tokens.accessToken}`,
                 'Content-Type': 'application/json',
-                'Origin': 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
+                Origin: 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
+                'User-Agent': getRandomUserAgent()
             }
         };
+
         const response = await axios(axiosConfig);
-        const dataObj = response.data.data;
+
+        const dataObj = response.data?.data;
+
         const result = Object.keys(dataObj).map(assetKey => {
             const assetData = dataObj[assetKey];
             return {
                 asset: assetKey,
-                msg_hash: assetData.timestamped_signature.msg_hash,
+                msg_hash: assetData.timestamped_signature?.msg_hash,
                 price: assetData.price,
-                timestamp: new Date(assetData.timestamped_signature.timestamp / 1000000).toISOString(),
+                timestamp: new Date(assetData.timestamped_signature?.timestamp / 1000000).toISOString(),
                 ...assetData
             };
         });
-        coloredLog(`Berhasil mengambil ${result.length} harga yang ditandatangani`, 'INFO', 'green');
+
+        coloredLog(`Berhasil mengambil${result.length} harga yang ditandatangani`, 'INFO', 'green');
+
         return result;
+
     } catch (error) {
-        coloredLog(`Error mendapatkan harga yang ditandatangani: ${error.message}`, 'ERROR');
+        coloredLog(`Error mendapatkan harga yang ditandatangani:${error.message}`, 'ERROR');
+
+        if (error.message.includes('WAF') && wafRetryCount < config.waf.maxRetries) {
+            const delay = config.waf.retryIntervalSeconds * 1000;
+
+            coloredLog(`WAF terdeteksi,mencoba lagi setelah${config.waf.retryIntervalSeconds} detik(percobaan${wafRetryCount + 1})`, 'WARN');
+
+            await new Promise(resolve => setTimeout(resolve, delay));
+
+            return getSignedPrices(tokens, config, wafRetryCount + 1); // Rekursi dengan wafRetryCount bertambah
+
+        }
         throw error;
+
     }
 }
 
-async function sendValidation(tokens, msgHash, isValid) {
+async function sendValidation(tokens, msgHash, isValid, config, wafRetryCount = 0) {
     try {
         await randomDelay(1000, 3000); // Delay sebelum permintaan
 
@@ -339,48 +415,76 @@ async function sendValidation(tokens, msgHash, isValid) {
             method: 'POST',
             url: 'https://app-api.jp.stork-oracle.network/v1/stork_signed_prices/validations',
             headers: {
-                'Authorization': `Bearer ${tokens.accessToken}`,
+                Authorization: `Bearer ${tokens.accessToken}`,
                 'Content-Type': 'application/json',
-                'Origin': 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
+                Origin: 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
+                'User-Agent': getRandomUserAgent()
             },
+
             data: { msg_hash: msgHash, valid: isValid }
         };
+
         const response = await axios(axiosConfig);
-        coloredLog(`? Validasi berhasil untuk ${msgHash.substring(0, 10)}...`, 'INFO', 'green');
+        coloredLog(`? Validasi berhasil untuk${msgHash?.substring(0, 10)}...`, 'INFO', 'green');
+
         return response.data;
+
     } catch (error) {
-        coloredLog(`? Validasi gagal untuk ${msgHash.substring(0, 10)}...: ${error.message}`, 'ERROR');
+        coloredLog(`? Validasi gagal untuk${msgHash?.substring(0, 10)}...:${error.message}`, 'ERROR');
+
+        if (error.message.includes('WAF') && wafRetryCount < config.waf.maxRetries) {
+            const delay = config.waf.retryIntervalSeconds * 1000;
+
+            coloredLog(`WAF terdeteksi,mencoba lagi setelah${config.waf.retryIntervalSeconds} detik(percobaan${wafRetryCount + 1})`, 'WARN');
+
+            await new Promise(resolve => setTimeout(resolve, delay));
+
+            return sendValidation(tokens, msgHash, isValid, config, wafRetryCount + 1); // Rekursi dengan wafRetryCount bertambah
+
+        }
         throw error;
+
     }
 }
 
-async function getUserStats(tokens) {
+async function getUserStats(tokens, config, wafRetryCount = 0) {
     try {
         coloredLog('Mengambil statistik pengguna...', 'INFO', 'cyan');
+
         const axiosConfig = {
             method: 'GET',
             url: 'https://app-api.jp.stork-oracle.network/v1/me',
             headers: {
-                'Authorization': `Bearer ${tokens.accessToken}`,
+                Authorization: `Bearer ${tokens.accessToken}`,
                 'Content-Type': 'application/json',
-                'Origin': 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
+                Origin: 'chrome-extension://knnliglhgkmlblppdejchidfihjnockl',
+                'User-Agent': getRandomUserAgent()
             }
         };
 
         const response = await axios(axiosConfig);
-        return response.data.data;
+        return response.data?.data;
+
     } catch (error) {
-        coloredLog(`Error mendapatkan statistik pengguna: ${error.message}`, 'ERROR');
+        coloredLog(`Error mendapatkan statistik pengguna:${error.message}`, 'ERROR');
+
+        if (error.message.includes('WAF') && wafRetryCount < config.waf.maxRetries) {
+            const delay = config.waf.retryIntervalSeconds * 1000;
+
+            coloredLog(`WAF terdeteksi,mencoba lagi setelah${config.waf.retryIntervalSeconds} detik(percobaan${wafRetryCount + 1})`, 'WARN');
+
+            await new Promise(resolve => setTimeout(resolve, delay));
+
+            return getUserStats(tokens, config, wafRetryCount + 1); // Rekursi dengan wafRetryCount bertambah
+        }
         throw error;
     }
 }
 
 function validatePrice(priceData) {
     try {
-        coloredLog(`Memvalidasi data untuk ${priceData.asset || 'aset tidak dikenal'}`, 'INFO', 'cyan');
-        if (!priceData.msg_hash || !priceData.price || !priceData.timestamp) {
+        coloredLog(`Memvalidasi data untuk ${priceData?.asset || 'aset tidak dikenal'}`, 'INFO', 'cyan');
+        if (!priceData?.msg_hash || !priceData?.price || !priceData?.timestamp) {
             coloredLog('Data tidak lengkap, dianggap tidak valid', 'WARN');
             return false;
         }
@@ -399,12 +503,12 @@ function validatePrice(priceData) {
 }
 
 if (!isMainThread) {
-    const { priceData, tokens } = workerData;
+    const { priceData, tokens, config } = workerData;
 
     async function validateAndSend() {
         try {
             const isValid = validatePrice(priceData);
-            await sendValidation(tokens, priceData.msg_hash, isValid);
+            await sendValidation(tokens, priceData.msg_hash, isValid, config);
             parentPort.postMessage({ success: true, msgHash: priceData.msg_hash, isValid });
         } catch (error) {
             parentPort.postMessage({ success: false, error: error.message, msgHash: priceData.msg_hash });
@@ -419,7 +523,7 @@ if (!isMainThread) {
         try {
             coloredLog(`--------- MEMULAI PROSES VALIDASI untuk ${config.cognito.username} ---------`, 'INFO', 'blue');
             const tokens = await getTokens(config);
-            const initialUserData = await getUserStats(tokens);
+            const initialUserData = await getUserStats(tokens, config);
 
             if (!initialUserData || !initialUserData.stats) {
                 throw new Error('Tidak dapat mengambil statistik pengguna awal');
@@ -436,8 +540,8 @@ if (!isMainThread) {
             const signedPrices = await getSignedPrices(tokens, config);
 
             if (!signedPrices || signedPrices.length === 0) {
-                coloredLog('No data to validate', 'WARN');
-                const userData = await getUserStats(tokens);
+                coloredLog('Tidak ada data untuk divalidasi', 'WARN');
+                const userData = await getUserStats(tokens, config);
                 displayStats(userData, config);
                 return;
             }
@@ -457,11 +561,18 @@ if (!isMainThread) {
                 batch.forEach(priceData => {
                     workers.push(new Promise((resolve) => {
                         const worker = new Worker(__filename, {
-                            workerData: { priceData, tokens }
+                            workerData: { priceData, tokens, config }
                         });
                         worker.on('message', resolve);
                         worker.on('error', (error) => resolve({ success: false, error: error.message }));
-                        worker.on('exit', () => resolve({ success: false, error: 'Worker exited' }));
+                        worker.on('exit', (code) => {
+                            if (code !== 0) {
+                                coloredLog(`Worker berhenti dengan kode ${code}`, 'ERROR');
+                                resolve({ success: false, error: `Worker exited with code ${code}` });
+                            } else {
+                                resolve({ success: false, error: 'Worker exited' });
+                            }
+                        });
                     }));
                 });
             }
@@ -470,9 +581,9 @@ if (!isMainThread) {
             const successCount = results.filter(r => r.success).length;
             coloredLog(`Processed ${successCount}/${results.length} validations successfully`, 'INFO', 'green');
 
-            const updatedUserData = await getUserStats(tokens);
-            const newValidCount = updatedUserData.stats.stork_signed_prices_valid_count || 0;
-            const newInvalidCount = updatedUserData.stats.stork_signed_prices_invalid_count || 0;
+            const updatedUserData = await getUserStats(tokens, config);
+            const newValidCount = updatedUserData.stats?.stork_signed_prices_valid_count || 0;
+            const newInvalidCount = updatedUserData.stats?.stork_signed_prices_invalid_count || 0;
 
             const actualValidIncrease = newValidCount - previousStats.validCount;
             const actualInvalidIncrease = newInvalidCount - previousStats.invalidCount;
@@ -489,17 +600,16 @@ if (!isMainThread) {
         } catch (error) {
             coloredLog(`Validation process stopped: ${error.message}`, 'ERROR');
         } finally {
-            // Segera jadwalkan ulang proses berikutnya
-            setTimeout(() => runValidationProcess(tokenManager, config), 0);  // Jalankan segera
+            setTimeout(() => runValidationProcess(tokenManager, config), config.stork.intervalSeconds * 1000);
         }
     }
 
     async function getTokens(config) {
-        const tokenManager = new TokenManager(config.cognito); // Pass config.cognito here
+        const tokenManager = new TokenManager(config.cognito);
         try {
             await tokenManager.getValidToken();
             const tokensData = await tokenManager.loadTokens();
-            if (!tokensData || !tokensData.accessToken) {
+             if (!tokensData || !tokensData.accessToken) {
                 throw new Error('No valid access token found');
             }
             return tokensData;
@@ -526,12 +636,11 @@ if (!isMainThread) {
         console.log(colors.FG_WHITE + `Referral Code: ${userData.referral_code || 'N/A'}` + colors.RESET);
         console.log(colors.FG_CYAN + '---------------------------------------------' + colors.RESET);
         console.log(colors.BRIGHT + colors.FG_GREEN + 'VALIDATION STATISTICS:' + colors.RESET);
-        console.log(colors.FG_GREEN + `? Valid Validations: ${userData.stats.stork_signed_prices_valid_count || 0}` + colors.RESET);
-        console.log(colors.FG_RED + `? Invalid Validations: ${userData.stats.stork_signed_prices_invalid_count || 0}` + colors.RESET);
-        console.log(colors.FG_WHITE + `? Terakhir Divalidasi Pada: ${userData.stats.stork_signed_prices_last_verified_at || 'Tidak Pernah'}` + colors.RESET);
-        console.log(colors.FG_WHITE + `?? Penggunaan Referral: ${userData.stats.referral_usage_count || 0}` + colors.RESET);
+        console.log(colors.FG_GREEN + `? Valid Validations: ${userData.stats?.stork_signed_prices_valid_count || 0}` + colors.RESET);
+        console.log(colors.FG_RED + `? Invalid Validations: ${userData.stats?.stork_signed_prices_invalid_count || 0}` + colors.RESET);
+        console.log(colors.FG_WHITE + `? Terakhir Divalidasi Pada: ${userData.stats?.stork_signed_prices_last_verified_at || 'Tidak Pernah'}` + colors.RESET);
+        console.log(colors.FG_WHITE + `?? Penggunaan Referral: ${userData.stats?.referral_usage_count || 0}` + colors.RESET);
         console.log(colors.FG_CYAN + '---------------------------------------------' + colors.RESET);
-        //Removed: console.log(colors.FG_YELLOW + `Next validation in ${config.stork.intervalSeconds} seconds...` + colors.RESET);
         console.log(colors.BRIGHT + colors.FG_CYAN + '=============================================' + colors.RESET);
     }
 
@@ -553,7 +662,8 @@ if (!isMainThread) {
                     password: account.password
                 },
                 stork: userConfig.stork,
-                threads: userConfig.threads
+                threads: userConfig.threads,
+                waf: userConfig.waf
             };
 
             if (!validateAccountConfig(config.cognito)) {
@@ -565,8 +675,6 @@ if (!isMainThread) {
                 const tokenManager = new TokenManager(config.cognito);
                 await tokenManager.getValidToken();
                 coloredLog(`Authentication successful for ${account.username}`, 'INFO', 'green');
-
-                // Remove initial delay
                 runValidationProcess(tokenManager, config);
             } catch (error) {
                 coloredLog(`Error with account ${account.username}: ${error.message}`, 'ERROR');
